@@ -235,6 +235,31 @@ class AudioPipe:
             self.stream.close()
 
 
+async def find_paired_address():
+    """从 Windows 系统设备清单找已配对的遥控器地址。
+
+    遥控器休眠时不广播，扫描必然失败；但已配对设备永远在系统清单里。
+    返回 (address, name) 或 None。"""
+    try:
+        from winrt.windows.devices.bluetooth import BluetoothLEDevice  # noqa: F401
+        from winrt.windows.devices.enumeration import DeviceInformation
+        devs = await DeviceInformation.find_all_async(0)
+    except Exception:
+        logging.info('系统设备清单不可用', exc_info=True)
+        return None
+    import re
+    pat = re.compile(r'BTHLE#DEV_([0-9A-Fa-f]{12})#', re.I)
+    for d in devs:
+        name = d.name or ''
+        if any(h in name for h in NAME_HINTS):
+            m = pat.search(d.id or '')
+            if m:
+                h = m.group(1)
+                address = ':'.join(h[i:i + 2] for i in range(0, 12, 2)).upper()
+                return address, name
+    return None
+
+
 class RemoteMic:
     def __init__(self, status=lambda text: None, addr=None, on_record=None):
         self.status = status
@@ -289,11 +314,19 @@ class RemoteMic:
         if address:
             self.status('正在连接遥控器（%s）……请按方向键唤醒它。' % address)
         else:
-            address, name = await scan_remote(self.status)
-            if not address:
-                raise RuntimeError('未扫描到遥控器，请按遥控器方向键唤醒后重试。')
-            self.status('找到遥控器 %s（%s），正在连接……' % (address, name))
+            # 休眠的遥控器不广播：先查系统已配对设备清单（不依赖广播）
+            found = await find_paired_address()
+            if found:
+                address, name = found
+                self.status('找到已配对的遥控器 %s（%s），正在连接……' % (address, name))
+            else:
+                # 清单里没有 = 从未配对的新设备：扫描（需先进入配对模式）
+                address, name = await scan_remote(self.status)
+                if not address:
+                    raise RuntimeError('未找到遥控器。旧遥控器请按方向键唤醒后重试；'
+                                       '新设备请长按 主页+音量- 进入配对模式（红灯闪烁）后重试。')
         self.audio = AudioPipe().start()
+        # 与原版一致的连接写法（真机验证可用）；地址来自 config/系统清单（见上）
         async with BleakClient(BLEDevice(address, 'Phicomm', None), timeout=20,
                                winrt={'use_cached_services': False}) as client:
             save_address(address)  # 首次连接成功，持久化地址
