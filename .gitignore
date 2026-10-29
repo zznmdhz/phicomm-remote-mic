@@ -22,3 +22,4 @@ services.json
 
 # 本地配置
 app/config.json
+python/
