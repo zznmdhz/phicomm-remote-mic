@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+venv/
+.venv/
+
+# 本地依赖目录（不入库）
+deps/
+
+# 音频 / 抓包产物
+recordings/
+captures/
+*.wav
+*.msbc
+*.log
+services.json
+*.capture.json
+
+# 第三方二进制（红线：不入库）
+*.7z
+*.apk
+*.so
+
+# 本地配置
+app/config.json

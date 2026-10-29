@@ -1,0 +1,8 @@
+# phicomm-remote-mic Python 依赖（Python 3.9+）
+bleak>=0.22
+sounddevice>=0.4
+
+# 另需系统级依赖（不通过 pip 安装）：
+# 1. FFmpeg —— 加入系统 PATH，用于 mSBC/SBC 解码（ffmpeg -f sbc）
+# 2. VB-CABLE —— 虚拟声卡，安装后提供 CABLE Input / CABLE Output 端点
+#    https://vb-audio.com/Cable/
