@@ -630,20 +630,30 @@ def gui(addr=None):
             hk_text.set(describe_hotkey(hk))
             dlg.destroy()
 
+        MOD_BY_CODE = {  # Windows VK 优先——键名会张冠李戴（右Alt 常被报成 alt_l）
+            162: ('lctrl', 0xA2), 163: ('rctrl', 0xA3),
+            164: ('lalt', 0xA4), 165: ('ralt', 0xA5),
+            16: ('shift', 0x10), 160: ('shift', 0x10), 161: ('shift', 0x10),
+        }
         MOD_BY_KEYSYM = {
-            'control_l': ('lctrl', 0xA2, 'ctrl'), 'control_r': ('rctrl', 0xA3, 'ctrl'),
-            'alt_l': ('lalt', 0xA4, 'alt'), 'alt_r': ('ralt', 0xA5, 'alt'),
-            'iso_level3_shift': ('ralt', 0xA5, 'alt'),   # Windows 上右Alt 常报为 AltGr
-            'shift_l': ('shift', 0x10, 'shift'), 'shift_r': ('shift', 0x10, 'shift'),
+            'control_l': ('lctrl', 0xA2), 'control_r': ('rctrl', 0xA3),
+            'alt_l': ('lalt', 0xA4), 'alt_r': ('ralt', 0xA5),
+            'iso_level3_shift': ('ralt', 0xA5),
+            'shift_l': ('shift', 0x10), 'shift_r': ('shift', 0x10),
         }
 
+        def mod_of(e):
+            code = getattr(e, 'keycode', None)
+            return MOD_BY_CODE.get(code) or MOD_BY_KEYSYM.get(e.keysym.lower())
+
         def on_key(e):
-            key = e.keysym.lower()
-            if key in MOD_BY_KEYSYM:
-                pending_mod[0] = key
+            mod = mod_of(e)
+            if mod:
+                pending_mod[0] = mod
                 msg.configure(text='松开即确认该键；或继续按一个主键组成组合键',
                               foreground=DIM)
                 return
+            key = e.keysym.lower()
             if key in ('win_l', 'win_r', 'meta_l', 'meta_r', 'caps_lock'):
                 msg.configure(text='这个键暂不支持，换一个试试', foreground=ERR)
                 return
@@ -654,16 +664,17 @@ def gui(addr=None):
                 mods.append('alt'); mod_vks.append(0x12)
             if e.state & 0x1:
                 mods.append('shift'); mod_vks.append(0x10)
-            vk = keysym_to_vk(key)
-            if vk is None:
+            code = getattr(e, 'keycode', None)
+            vk = code if isinstance(code, int) and 8 <= code <= 254 else keysym_to_vk(key)
+            if not vk:
                 msg.configure(text='这个键暂不支持，换一个试试', foreground=ERR)
                 return
-            save({'mods': mods, 'mod_vks': mod_vks, 'key': key, 'vk': vk})
+            save({'mods': mods, 'mod_vks': mod_vks, 'key': key, 'vk': int(vk)})
 
         def on_release(e):
-            key = e.keysym.lower()
-            if pending_mod[0] and key in MOD_BY_KEYSYM:
-                name, vk, _kind = MOD_BY_KEYSYM[key]
+            mod = mod_of(e)
+            if pending_mod[0] and mod:
+                name, vk = mod
                 pending_mod[0] = None
                 save({'mods': [], 'mod_vks': [], 'key': name, 'vk': vk})
 
