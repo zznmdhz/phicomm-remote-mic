@@ -585,21 +585,42 @@ def gui(addr=None):
     def open_hotkey_dialog():
         dlg = tk.Toplevel(window)
         dlg.title('设置听写快捷键')
-        dlg.geometry('360x160')
+        dlg.geometry('380x170')
         dlg.configure(bg=BG)
         dlg.resizable(False, False)
         dlg.grab_set()
         ttk.Label(dlg,
-                  text='直接按下你要的组合键，例如：\nCtrl+Alt+D、Shift+空格、F9\n'
-                       '（支持 Ctrl / Alt / Shift + 一个键）',
-                  style='Dim.TLabel', wraplength=330,
-                  justify='center').pack(pady=(14, 6))
+                  text='按下组合键（如 Ctrl+Alt+D、Shift+空格、F9），\n'
+                       '或只按一个修饰键（右Alt / 左Ctrl）后松开即可单独使用。\n'
+                       '（Win 键暂不支持）',
+                  style='Dim.TLabel', wraplength=350,
+                  justify='center').pack(pady=(12, 6))
         msg = ttk.Label(dlg, text='等待按键……', style='Status.TLabel')
         msg.pack(pady=4)
+        pending_mod = [None]
+
+        def save(hk):
+            app.hotkey = hk
+            save_hotkey(hk)
+            hk_text.set(describe_hotkey(hk))
+            dlg.destroy()
+
+        MOD_BY_KEYSYM = {
+            'control_l': ('lctrl', 0xA2, 'ctrl'), 'control_r': ('rctrl', 0xA3, 'ctrl'),
+            'alt_l': ('lalt', 0xA4, 'alt'), 'alt_r': ('ralt', 0xA5, 'alt'),
+            'iso_level3_shift': ('ralt', 0xA5, 'alt'),   # Windows 上右Alt 常报为 AltGr
+            'shift_l': ('shift', 0x10, 'shift'), 'shift_r': ('shift', 0x10, 'shift'),
+        }
+
         def on_key(e):
-            if e.keysym.lower() in ('control_l', 'control_r', 'alt_l', 'alt_r',
-                                    'shift_l', 'shift_r', 'win_l', 'win_r',
-                                    'caps_lock', 'meta_l', 'meta_r'):
+            key = e.keysym.lower()
+            if key in MOD_BY_KEYSYM:
+                pending_mod[0] = key
+                msg.configure(text='松开即确认该键；或继续按一个主键组成组合键',
+                              foreground=DIM)
+                return
+            if key in ('win_l', 'win_r', 'meta_l', 'meta_r', 'caps_lock'):
+                msg.configure(text='这个键暂不支持，换一个试试', foreground=ERR)
                 return
             mods, mod_vks = [], []
             if e.state & 0x4:
@@ -608,16 +629,21 @@ def gui(addr=None):
                 mods.append('alt'); mod_vks.append(0x12)
             if e.state & 0x1:
                 mods.append('shift'); mod_vks.append(0x10)
-            vk = keysym_to_vk(e.keysym)
+            vk = keysym_to_vk(key)
             if vk is None:
                 msg.configure(text='这个键暂不支持，换一个试试', foreground=ERR)
                 return
-            hk = {'mods': mods, 'mod_vks': mod_vks, 'key': e.keysym.lower(), 'vk': vk}
-            app.hotkey = hk
-            save_hotkey(hk)
-            hk_text.set(describe_hotkey(hk))
-            dlg.destroy()
+            save({'mods': mods, 'mod_vks': mod_vks, 'key': key, 'vk': vk})
+
+        def on_release(e):
+            key = e.keysym.lower()
+            if pending_mod[0] and key in MOD_BY_KEYSYM:
+                name, vk, _kind = MOD_BY_KEYSYM[key]
+                pending_mod[0] = None
+                save({'mods': [], 'mod_vks': [], 'key': name, 'vk': vk})
+
         dlg.bind('<KeyPress>', on_key)
+        dlg.bind('<KeyRelease>', on_release)
         dlg.focus_force()
     ttk.Button(hk_row, text='自定义…', command=open_hotkey_dialog).pack(side='left')
     ttk.Separator(window, orient='horizontal').pack(fill='x', padx=16, pady=8)
