@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -101,6 +102,9 @@ class InjectionTests(unittest.TestCase):
     def test_combo_order_extended_flags_and_visibility(self):
         events, held = [], set()
         class User32:
+            def MapVirtualKeyW(self, vk, mode):
+                return {0xA3: 0xE01D, 0x28: 0xE050}[vk]
+
             def keybd_event(self, vk, scan, flags, extra):
                 events.append((vk, flags))
                 if flags & mic.KEYEVENTF_KEYUP:
@@ -119,6 +123,9 @@ class InjectionTests(unittest.TestCase):
 
     def test_filtered_key_is_not_reported_as_success(self):
         class User32:
+            def MapVirtualKeyW(self, vk, mode):
+                return 0x38
+
             def keybd_event(self, *args):
                 pass
 
@@ -127,6 +134,29 @@ class InjectionTests(unittest.TestCase):
 
         with patch.object(ctypes.windll, 'user32', User32()):
             self.assertFalse(mic.send_dictation_tap(mic.DEFAULT_HOTKEY, verify=True))
+
+    def test_shift_capture_preserves_side_for_generic_tk_keycode(self):
+        self.assertEqual(mic.modifier_from_event(SimpleNamespace(keycode=16, keysym='Shift_R')),
+                         ('rshift', 0xA1))
+        self.assertEqual(mic.modifier_from_event(SimpleNamespace(keycode=16, keysym='Shift_L')),
+                         ('lshift', 0xA0))
+
+    def test_explicit_windows_vk_overrides_mislabelled_keysym(self):
+        self.assertEqual(mic.modifier_from_event(SimpleNamespace(keycode=165, keysym='Alt_L')),
+                         ('ralt', 0xA5))
+
+    def test_right_shift_injection_includes_scan_code(self):
+        events = []
+        class User32:
+            def MapVirtualKeyW(self, vk, mode):
+                assert vk == 0xA1 and mode == 4
+                return 0x36
+
+            def keybd_event(self, vk, scan, flags, extra):
+                events.append((vk, scan, flags))
+        with patch.object(ctypes.windll, 'user32', User32()):
+            mic.send_dictation_tap({'mods': [], 'mod_vks': [], 'key': 'rshift', 'vk': 0xA1})
+        self.assertEqual(events, [(0xA1, 0x36, 0), (0xA1, 0x36, 2)])
 
     def test_invalid_ime_key_falls_back_to_left_alt(self):
         hk = {'mods': [], 'mod_vks': [], 'key': '??', 'vk': 229}

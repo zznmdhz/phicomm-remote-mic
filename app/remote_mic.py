@@ -95,7 +95,21 @@ KEYEVENTF_EXTENDEDKEY = 0x0001
 DEFAULT_HOTKEY = {'mods': [], 'key': 'lalt', 'vk': 0xA4, 'mod_vks': []}
 LINKAGE_SILENCE = 0.35
 LINKAGE_POLL = 0.025
-HOTKEY_HINT = '闪电说请选「按一次开始、再按一次结束」，语音键绑定：左Alt。'
+HOTKEY_HINT = '闪电说使用「按一次开始、再按一次结束」，快捷键须与本工具完全一致（区分左右）。'
+
+_MOD_BY_CODE = {160: ('lshift', 0xA0), 161: ('rshift', 0xA1),
+                162: ('lctrl', 0xA2), 163: ('rctrl', 0xA3),
+                164: ('lalt', 0xA4), 165: ('ralt', 0xA5)}
+_MOD_BY_KEYSYM = {'shift_l': _MOD_BY_CODE[160], 'shift_r': _MOD_BY_CODE[161],
+                  'control_l': _MOD_BY_CODE[162], 'control_r': _MOD_BY_CODE[163],
+                  'alt_l': _MOD_BY_CODE[164], 'alt_r': _MOD_BY_CODE[165],
+                  'iso_level3_shift': _MOD_BY_CODE[165]}
+
+
+def modifier_from_event(event):
+    """具体 VK 优先；Tk 的通用 Shift/Ctrl/Alt 则由 keysym 区分左右。"""
+    return (_MOD_BY_CODE.get(getattr(event, 'keycode', None))
+            or _MOD_BY_KEYSYM.get(event.keysym.lower()))
 
 
 def valid_hotkey(hotkey):
@@ -151,6 +165,7 @@ def save_hotkey(hotkey):
 def describe_hotkey(hotkey):
     """组合键的显示文本，如 'ctrl+alt+d'、'右Alt'。"""
     alias = {'ralt': '右Alt', 'lalt': '左Alt', 'lctrl': '左Ctrl', 'rctrl': '右Ctrl',
+             'rshift': '右Shift', 'lshift': '左Shift', 'shift': 'Shift（未区分左右）',
              'space': '空格', 'return': '回车'}
     key = str(hotkey.get('key', '')).lower()
     parts = [m + '+' for m in hotkey.get('mods', [])]
@@ -192,7 +207,10 @@ def send_dictation_key(hotkey, action):
         flags = KEYEVENTF_EXTENDEDKEY if extended else 0
         if action == 'up':
             flags |= KEYEVENTF_KEYUP
-        ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
+        scan = ctypes.windll.user32.MapVirtualKeyW(vk, 4)
+        if scan & 0xFF00 == 0xE000:
+            flags |= KEYEVENTF_EXTENDEDKEY
+        ctypes.windll.user32.keybd_event(vk, scan & 0xFF, flags, 0)
 
 
 def send_right_alt_tap():
@@ -396,7 +414,7 @@ class RemoteMic:
                 if visible:
                     self.status('自检：系统已观察到快捷键。若听写未响应，请核对闪电说绑定、模式和权限。')
                 else:
-                    self.status('自检：系统未观察到完整快捷键，可能被拦截。请改用左Alt，且两边绑定一致。')
+                    self.status('自检：点按已发送，系统键状态未见全部按键。听写钩子可能已处理；请观察是否开始并结束。')
             except Exception as exc:
                 logging.exception('Hotkey self-test failed')
                 self.status('联动自检失败：' + str(exc))
@@ -519,11 +537,16 @@ class RemoteMic:
         """语音键联动（双点按）：音频流开始 = 敲一下听写键（开始听写），
         静音 0.35 秒 = 再敲一下（结束听写）。配合「按一次开始、再按一次结束」的听写工具。"""
         active_hotkey = None
-        def finish():
+        def finish(reason='shutdown'):
             nonlocal active_hotkey
             hotkey, active_hotkey = active_hotkey, None
             if hotkey is not None:
                 send_dictation_tap(hotkey)
+                audio = self.audio
+                logging.info('LINKAGE stop key=%s vk=0x%02X reason=%s packets=%s decoded=%s dropped=%s',
+                             describe_hotkey(hotkey), hotkey['vk'], reason,
+                             getattr(audio, 'packets', None), getattr(audio, 'decoded_bytes', None),
+                             getattr(audio, 'dropped_bytes', None))
         try:
             while not self._linkage_stop.is_set():
                 audio = self.audio
@@ -536,12 +559,15 @@ class RemoteMic:
                     break
                 if active_hotkey is not None and (not self.hotkey_enabled
                         or time.monotonic() - audio.last_packet >= LINKAGE_SILENCE):
-                    finish()
+                    finish('disabled' if not self.hotkey_enabled else 'silence')
                 elif (got and active_hotkey is None and self.hotkey_enabled
                       and time.monotonic() - audio.last_packet < LINKAGE_SILENCE):
                     hotkey = {**self.hotkey, 'mod_vks': list(self.hotkey.get('mod_vks', []))}
                     send_dictation_tap(hotkey)
                     active_hotkey = hotkey
+                    logging.info('LINKAGE start key=%s vk=0x%02X packet_age_ms=%.1f packets=%s',
+                                 describe_hotkey(hotkey), hotkey['vk'],
+                                 (time.monotonic() - audio.last_packet) * 1000, audio.packets)
         except Exception as exc:
             logging.exception('Dictation linkage failed')
             self.status('听写联动失败：' + str(exc))
@@ -612,7 +638,9 @@ def gui(addr=None):
         return
     handler = RotatingFileHandler(ROOT / 'remote-mic.log', maxBytes=256000,
                                   backupCount=1, encoding='utf-8')
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    logging.basicConfig(level=logging.INFO, handlers=[handler],
+                        format='%(asctime)s %(levelname)s %(message)s')
+    logging.info('APP START hotkey=%s config=%s', describe_hotkey(load_hotkey()), CONFIG_PATH)
     window = tk.Tk()
     window.title('斐讯遥控器麦克风')
     try:
@@ -650,6 +678,9 @@ def gui(addr=None):
     style.configure('Horizontal.TSeparator', background='#33333a')
     style.configure('TCombobox', fieldbackground=CARD, background=CARD,
                     foreground=FG, arrowcolor=FG)
+    style.map('TCombobox', fieldbackground=[('readonly', CARD)],
+              foreground=[('readonly', FG)], selectbackground=[('readonly', CARD)],
+              selectforeground=[('readonly', FG)])
     style.configure('Vertical.TScrollbar', background=CARD, troughcolor=BG,
                     arrowcolor=DIM)
     messages = collections.deque()
@@ -672,6 +703,7 @@ def gui(addr=None):
     def toggle_hotkey():
         app.hotkey_enabled = hotkey_var.get()
         save_dictation_enabled(app.hotkey_enabled)
+        logging.info('LINKAGE enabled=%s', app.hotkey_enabled)
     hotkey_bar = ttk.Frame(window)
     hotkey_bar.pack(fill='x', padx=20)
     ttk.Checkbutton(hotkey_bar, text='语音键联动（按住说话自动开关听写）',
@@ -680,7 +712,7 @@ def gui(addr=None):
               text='配合「按一次开始、再按一次结束」的听写工具（如闪电说）：'
                    '按下语音键=开始，松开约0.35秒后结束。',
               style='Dim.TLabel', wraplength=520).pack(anchor='w', padx=(22, 0))
-    ttk.Label(hotkey_bar, text=HOTKEY_HINT + '\n本机曾出现右Alt注入被拦截，推荐左Alt。',
+    ttk.Label(hotkey_bar, text=HOTKEY_HINT,
               style='Hint.TLabel', wraplength=520).pack(anchor='w', padx=(22, 0))
     hk_row = ttk.Frame(window)
     hk_row.pack(fill='x', padx=20, pady=(4, 0))
@@ -704,33 +736,22 @@ def gui(addr=None):
         msg = ttk.Label(dlg, text='等待按键……', style='Status.TLabel')
         msg.pack(pady=4)
         pending_mod = [None]
+        pressed_mods = {}
 
         def save(hk):
             app.hotkey = hk
             save_hotkey(hk)
             hk_text.set(describe_hotkey(hk))
+            logging.info('HOTKEY saved key=%s vk=0x%02X mods=%s',
+                         describe_hotkey(hk), hk['vk'], hk['mod_vks'])
             dlg.destroy()
 
-        MOD_BY_CODE = {  # Windows VK 优先——键名会张冠李戴（右Alt 常被报成 alt_l）
-            162: ('lctrl', 0xA2), 163: ('rctrl', 0xA3),
-            164: ('lalt', 0xA4), 165: ('ralt', 0xA5),
-            16: ('shift', 0x10), 160: ('shift', 0x10), 161: ('shift', 0x10),
-        }
-        MOD_BY_KEYSYM = {
-            'control_l': ('lctrl', 0xA2), 'control_r': ('rctrl', 0xA3),
-            'alt_l': ('lalt', 0xA4), 'alt_r': ('ralt', 0xA5),
-            'iso_level3_shift': ('ralt', 0xA5),
-            'shift_l': ('shift', 0x10), 'shift_r': ('shift', 0x10),
-        }
-
-        def mod_of(e):
-            code = getattr(e, 'keycode', None)
-            return MOD_BY_CODE.get(code) or MOD_BY_KEYSYM.get(e.keysym.lower())
-
         def on_key(e):
-            mod = mod_of(e)
+            mod = modifier_from_event(e)
             if mod:
                 pending_mod[0] = mod
+                family = 'shift' if 'shift' in mod[0] else 'ctrl' if 'ctrl' in mod[0] else 'alt'
+                pressed_mods[family] = mod[1]
                 msg.configure(text='松开即确认该键；或继续按一个主键组成组合键',
                               foreground=DIM)
                 return
@@ -740,11 +761,11 @@ def gui(addr=None):
                 return
             mods, mod_vks = [], []
             if e.state & 0x4:
-                mods.append('ctrl'); mod_vks.append(0x11)
+                mods.append('ctrl'); mod_vks.append(pressed_mods.get('ctrl', 0xA2))
             if e.state & 0x8:
-                mods.append('alt'); mod_vks.append(0x12)
+                mods.append('alt'); mod_vks.append(pressed_mods.get('alt', 0xA4))
             if e.state & 0x1:
-                mods.append('shift'); mod_vks.append(0x10)
+                mods.append('shift'); mod_vks.append(pressed_mods.get('shift', 0xA0))
             code = getattr(e, 'keycode', None)
             vk = code if isinstance(code, int) and 8 <= code <= 254 else keysym_to_vk(key)
             if not vk or vk in (0xE5, 0xE7):
@@ -753,9 +774,9 @@ def gui(addr=None):
             save({'mods': mods, 'mod_vks': mod_vks, 'key': key, 'vk': int(vk)})
 
         def on_release(e):
-            mod = mod_of(e)
+            mod = modifier_from_event(e)
             if pending_mod[0] and mod:
-                name, vk = mod
+                name, vk = pending_mod[0]
                 pending_mod[0] = None
                 save({'mods': [], 'mod_vks': [], 'key': name, 'vk': vk})
 
@@ -765,6 +786,20 @@ def gui(addr=None):
     ttk.Button(hk_row, text='自定义…', command=open_hotkey_dialog).pack(side='left')
     linkage_test = ttk.Button(hk_row, text='联动自检', command=app.start_hotkey_test)
     linkage_test.pack(side='left', padx=8)
+    presets = {'左Shift': ('lshift', 0xA0), '右Shift': ('rshift', 0xA1),
+               '左Alt': ('lalt', 0xA4), '右Alt': ('ralt', 0xA5),
+               '左Ctrl': ('lctrl', 0xA2), '右Ctrl': ('rctrl', 0xA3), 'F9': ('f9', 0x78)}
+    preset = ttk.Combobox(hk_row, values=list(presets), state='readonly', width=8)
+    preset.set('直接选键')
+    preset.pack(side='left')
+    def choose_preset(_event):
+        key, vk = presets[preset.get()]
+        hotkey = {'mods': [], 'mod_vks': [], 'key': key, 'vk': vk}
+        app.hotkey = hotkey
+        save_hotkey(hotkey)
+        hk_text.set(describe_hotkey(hotkey))
+        logging.info('HOTKEY preset key=%s vk=0x%02X', describe_hotkey(hotkey), vk)
+    preset.bind('<<ComboboxSelected>>', choose_preset)
     ttk.Label(window, text='断开连接后可自检：会自动发送开始/结束两次快捷键。',
               style='Dim.TLabel').pack(anchor='w', padx=42, pady=(2, 0))
     ttk.Separator(window, orient='horizontal').pack(fill='x', padx=16, pady=8)
