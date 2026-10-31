@@ -90,16 +90,72 @@ def save_dictation_enabled(value):
 
 
 VK_RMENU = 0xA5  # 右 Alt 虚拟键码
+KEYEVENTF_KEYUP = 0x0002
+DEFAULT_HOTKEY = {'mods': [], 'key': 'ralt', 'vk': VK_RMENU, 'mod_vks': []}
+
+_KEYSYM_VK = {**{chr(c): c for c in range(ord('a'), ord('z') + 1)},
+              **{str(d): 0x30 + d for d in range(10)},
+              'space': 0x20, 'return': 0x0D, 'escape': 0x1B, 'tab': 0x09,
+              'minus': 0xBD, 'equal': 0xBB, 'comma': 0xBC, 'period': 0xBE,
+              'slash': 0xBF, 'grave': 0xC0, 'bracketleft': 0xDB,
+              'bracketright': 0xDD, 'semicolon': 0xBA, 'quote': 0xDE,
+              'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28,
+              'home': 0x24, 'end': 0x23, 'prior': 0x21, 'next': 0x22,
+              'insert': 0x2D, 'delete': 0x2E}
+_KEYSYM_VK.update({'f%d' % i: 0x6F + i for i in range(1, 13)})
+
+
+def keysym_to_vk(keysym):
+    """tk keysym → Windows 虚拟键码；不支持返回 None。"""
+    k = keysym.lower()
+    if k in _KEYSYM_VK:
+        return _KEYSYM_VK[k]
+    if len(k) == 1 and k.isprintable():
+        return ord(k.upper())
+    return None
+
+
+def load_hotkey():
+    """读取自定义听写快捷键；缺失/损坏返回默认（右Alt）。"""
+    hk = load_config().get('hotkey')
+    if (isinstance(hk, dict) and isinstance(hk.get('vk'), int)
+            and isinstance(hk.get('mods'), list) and 'key' in hk):
+        return hk
+    return dict(DEFAULT_HOTKEY)
+
+
+def save_hotkey(hotkey):
+    save_config_value('hotkey', hotkey)
+
+
+def describe_hotkey(hotkey):
+    """组合键的显示文本，如 'ctrl+alt+d'、'右Alt'。"""
+    alias = {'ralt': '右Alt', 'lalt': '左Alt', 'lctrl': '左Ctrl', 'rctrl': '右Ctrl',
+             'space': '空格', 'return': '回车'}
+    key = str(hotkey.get('key', '')).lower()
+    parts = [m + '+' for m in hotkey.get('mods', [])]
+    return ''.join(parts) + alias.get(key, key)
+
+
+def send_dictation_tap(hotkey):
+    """按配置合成一次听写快捷键点按（修饰键 down → 主键 down/up → 修饰键 up）。"""
+    try:
+        user32 = ctypes.windll.user32
+        mod_vks = hotkey.get('mod_vks') or []
+        vk = int(hotkey['vk'])
+        for m in mod_vks:
+            user32.keybd_event(int(m), 0, 0, 0)
+        user32.keybd_event(vk, 0, 0, 0)
+        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+        for m in reversed(mod_vks):
+            user32.keybd_event(int(m), 0, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        logging.warning('合成听写快捷键失败', exc_info=True)
 
 
 def send_right_alt_tap():
-    """合成一次右 Alt 点按（down 后立刻 up），作为听写工具的开始/结束开关。"""
-    try:
-        user32 = ctypes.windll.user32
-        user32.keybd_event(VK_RMENU, 0, 0, 0)        # 按下右 Alt
-        user32.keybd_event(VK_RMENU, 0, 0x0002, 0)   # KEYEVENTF_KEYUP 抬起
-    except Exception:
-        logging.warning('合成右 Alt 点按失败', exc_info=True)
+    """兼容保留：默认右Alt 点按。"""
+    send_dictation_tap(DEFAULT_HOTKEY)
 
 
 async def scan_remote(status, timeout=8.0):
@@ -272,7 +328,8 @@ class RemoteMic:
         self.test_thread = None
         self.test_running = False
         self.test_stop = threading.Event()
-        self.hotkey_enabled = load_dictation_enabled()  # 语音键联动（右Alt 开关听写）
+        self.hotkey_enabled = load_dictation_enabled()  # 语音键联动开关
+        self.hotkey = load_hotkey()                     # 听写快捷键（默认右Alt）
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -373,7 +430,7 @@ class RemoteMic:
                                 and now - last_hotkey >= 0.25):  # 250ms 去抖
                             was_speaking = speaking
                             last_hotkey = now
-                            send_right_alt_tap()
+                            send_dictation_tap(self.hotkey)
                     await asyncio.sleep(.5)
                 if not self.stop_event.is_set():
                     self.status('蓝牙连接已断开，请唤醒遥控器后重新连接。')
@@ -454,19 +511,55 @@ def gui(addr=None):
     logging.basicConfig(level=logging.INFO, handlers=[handler])
     window = tk.Tk()
     window.title('斐讯遥控器麦克风')
-    window.geometry('580x530')
+    try:
+        window.iconbitmap(str(ROOT / 'icon.ico'))
+    except Exception:
+        pass
+    window.geometry('580x580')
     window.resizable(False, False)
+    # ---- 深色工作台主题：纯 tkinter/ttk，零额外依赖 ----
+    BG, CARD, FG, DIM, ACCENT, GREEN, ERR = ('#17171a', '#212126', '#e8e8ea',
+                                             '#8b8b93', '#f5a623', '#4ec26a', '#e05b5b')
+    window.configure(bg=BG)
+    style = ttk.Style(window)
+    style.theme_use('clam')
+    style.configure('.', background=BG, foreground=FG, font=('Microsoft YaHei UI', 10))
+    style.configure('TFrame', background=BG)
+    style.configure('TLabel', background=BG, foreground=FG)
+    style.configure('Dim.TLabel', background=BG, foreground=DIM,
+                    font=('Microsoft YaHei UI', 8))
+    style.configure('Status.TLabel', background=BG, foreground=DIM,
+                    font=('Consolas', 9))
+    style.configure('Title.TLabel', background=BG, foreground=FG,
+                    font=('Microsoft YaHei UI', 14, 'bold'))
+    style.configure('Hint.TLabel', background=BG, foreground=ACCENT,
+                    font=('Microsoft YaHei UI', 10, 'bold'))
+    style.configure('TButton', background=CARD, foreground=FG, padding=(14, 6))
+    style.map('TButton', background=[('active', '#2e2e35'), ('disabled', BG)],
+              foreground=[('disabled', '#55555c')])
+    style.configure('Accent.TButton', background=ACCENT, foreground=BG,
+                    padding=(18, 6), font=('Microsoft YaHei UI', 10, 'bold'))
+    style.map('Accent.TButton', background=[('active', '#ffb84d'), ('disabled', '#4a4436')],
+              foreground=[('disabled', '#8a8478')])
+    style.configure('TCheckbutton', background=BG, foreground=FG)
+    style.map('TCheckbutton', background=[('active', BG)], foreground=[('active', ACCENT)])
+    style.configure('Horizontal.TSeparator', background='#33333a')
+    style.configure('TCombobox', fieldbackground=CARD, background=CARD,
+                    foreground=FG, arrowcolor=FG)
+    style.configure('Vertical.TScrollbar', background=CARD, troughcolor=BG,
+                    arrowcolor=DIM)
     messages = collections.deque()
     record_dirty = [True]
     app = RemoteMic(messages.append, addr=addr,
                     on_record=lambda: record_dirty.__setitem__(0, True))
-    ttk.Label(window, text='斐讯遥控器 → 无线麦克风', font=('Microsoft YaHei UI', 15)).pack(pady=(18, 8))
+    ttk.Label(window, text='●  斐讯遥控器 → 无线麦克风',
+              style='Title.TLabel').pack(pady=(16, 6))
     label = ttk.Label(window, text='点击连接，按方向键唤醒遥控器。',
-                      font=('Microsoft YaHei UI', 10), wraplength=540, justify='center')
-    label.pack(pady=6)
+                      style='Status.TLabel', wraplength=540, justify='center')
+    label.pack(pady=4)
     buttons = ttk.Frame(window)
     buttons.pack(pady=8)
-    start = ttk.Button(buttons, text='连接', command=app.start)
+    start = ttk.Button(buttons, text='连接', command=app.start, style='Accent.TButton')
     start.pack(side='left', padx=10)
     ttk.Button(buttons, text='停止', command=app.stop).pack(side='left', padx=10)
     test = ttk.Button(buttons, text='测试输入', command=app.start_test, state='disabled')
@@ -477,14 +570,57 @@ def gui(addr=None):
         save_dictation_enabled(app.hotkey_enabled)
     hotkey_bar = ttk.Frame(window)
     hotkey_bar.pack(fill='x', padx=20)
-    ttk.Checkbutton(hotkey_bar, text='语音键联动（按住说话自动开关听写·右Alt）',
+    ttk.Checkbutton(hotkey_bar, text='语音键联动（按住说话自动开关听写）',
                     variable=hotkey_var, command=toggle_hotkey).pack(anchor='w')
     ttk.Label(hotkey_bar,
               text='适用于「按一次开始、再按一次结束」的听写工具（如闪电说、豆包免按模式）；'
                    '若使用长按式的语音工具请关闭本开关。',
-              font=('Microsoft YaHei UI', 8), foreground='#777777',
-              wraplength=520).pack(anchor='w', padx=(22, 0))
-    ttk.Separator(window, orient='horizontal').pack(fill='x', padx=16, pady=6)
+              style='Dim.TLabel', wraplength=520).pack(anchor='w', padx=(22, 0))
+    hk_row = ttk.Frame(window)
+    hk_row.pack(fill='x', padx=20, pady=(4, 0))
+    ttk.Label(hk_row, text='听写快捷键：').pack(side='left')
+    hk_text = tk.StringVar(value=describe_hotkey(app.hotkey))
+    ttk.Label(hk_row, textvariable=hk_text, foreground=ACCENT).pack(side='left',
+                                                                  padx=(2, 12))
+    def open_hotkey_dialog():
+        dlg = tk.Toplevel(window)
+        dlg.title('设置听写快捷键')
+        dlg.geometry('360x160')
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        ttk.Label(dlg,
+                  text='直接按下你要的组合键，例如：\nCtrl+Alt+D、Shift+空格、F9\n'
+                       '（支持 Ctrl / Alt / Shift + 一个键）',
+                  style='Dim.TLabel', wraplength=330,
+                  justify='center').pack(pady=(14, 6))
+        msg = ttk.Label(dlg, text='等待按键……', style='Status.TLabel')
+        msg.pack(pady=4)
+        def on_key(e):
+            if e.keysym.lower() in ('control_l', 'control_r', 'alt_l', 'alt_r',
+                                    'shift_l', 'shift_r', 'win_l', 'win_r',
+                                    'caps_lock', 'meta_l', 'meta_r'):
+                return
+            mods, mod_vks = [], []
+            if e.state & 0x4:
+                mods.append('ctrl'); mod_vks.append(0x11)
+            if e.state & 0x8:
+                mods.append('alt'); mod_vks.append(0x12)
+            if e.state & 0x1:
+                mods.append('shift'); mod_vks.append(0x10)
+            vk = keysym_to_vk(e.keysym)
+            if vk is None:
+                msg.configure(text='这个键暂不支持，换一个试试', foreground=ERR)
+                return
+            hk = {'mods': mods, 'mod_vks': mod_vks, 'key': e.keysym.lower(), 'vk': vk}
+            app.hotkey = hk
+            save_hotkey(hk)
+            hk_text.set(describe_hotkey(hk))
+            dlg.destroy()
+        dlg.bind('<KeyPress>', on_key)
+        dlg.focus_force()
+    ttk.Button(hk_row, text='自定义…', command=open_hotkey_dialog).pack(side='left')
+    ttk.Separator(window, orient='horizontal').pack(fill='x', padx=16, pady=8)
     record_bar = ttk.Frame(window)
     record_bar.pack(fill='x', padx=16)
     ttk.Label(record_bar, text='测试录音（点“测试输入”后生成，可回放核对）',
@@ -514,16 +650,19 @@ def gui(addr=None):
     ttk.Button(record_buttons, text='打开声音设置', command=open_sound_settings).pack(side='left', padx=4)
     list_frame = ttk.Frame(window)
     list_frame.pack(fill='both', expand=True, padx=16, pady=6)
-    listing = tk.Listbox(list_frame, height=7, font=('Consolas', 9))
+    listing = tk.Listbox(list_frame, height=7, font=('Consolas', 9), bg=CARD, fg=FG,
+                         selectbackground=ACCENT, selectforeground=BG,
+                         highlightthickness=0, relief='flat', borderwidth=0,
+                         activestyle='none')
     scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=listing.yview)
     listing.configure(yscrollcommand=scrollbar.set)
     listing.pack(side='left', fill='both', expand=True)
     scrollbar.pack(side='right', fill='y')
     hint = ttk.Label(window, text='在 AI 应用的麦克风设置里选择：CABLE Output',
-                     font=('Microsoft YaHei UI', 10, 'bold'), foreground='#0066cc')
+                     style='Hint.TLabel')
     hint.pack(pady=(4, 2))
     ttk.Label(window, text='音频只在本机转发。关闭窗口会停止传输。',
-              font=('Microsoft YaHei UI', 9)).pack(pady=(0, 8))
+              style='Dim.TLabel').pack(pady=(0, 10))
     closing = False
     def close():
         nonlocal closing
@@ -533,7 +672,14 @@ def gui(addr=None):
         label.configure(text='正在关闭语音通道……')
     def poll():
         while messages:
-            label.configure(text=messages.popleft())
+            text = messages.popleft()
+            if any(w in text for w in ('已连接', '正在传输')):
+                color = GREEN
+            elif any(w in text for w in ('失败', '错误', '断开')):
+                color = ERR
+            else:
+                color = DIM
+            label.configure(text=text, foreground=color)
         running = bool(app.thread and app.thread.is_alive())
         start.configure(state='disabled' if running or closing else 'normal')
         test.configure(state='normal' if (app.connected and not app.test_running) else 'disabled')
