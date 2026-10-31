@@ -139,18 +139,26 @@ def describe_hotkey(hotkey):
 
 def send_dictation_tap(hotkey):
     """按配置合成一次听写快捷键点按（修饰键 down → 主键 down/up → 修饰键 up）。"""
+    send_dictation_key(hotkey, 'down')
+    send_dictation_key(hotkey, 'up')
+
+
+def send_dictation_key(hotkey, action):
+    """按配置按下('down')/抬起('up')听写键——真按住/真松开，配合长按式听写。"""
     try:
         user32 = ctypes.windll.user32
         mod_vks = hotkey.get('mod_vks') or []
         vk = int(hotkey['vk'])
-        for m in mod_vks:
-            user32.keybd_event(int(m), 0, 0, 0)
-        user32.keybd_event(vk, 0, 0, 0)
-        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-        for m in reversed(mod_vks):
-            user32.keybd_event(int(m), 0, KEYEVENTF_KEYUP, 0)
+        if action == 'down':
+            for m in mod_vks:
+                user32.keybd_event(int(m), 0, 0, 0)
+            user32.keybd_event(vk, 0, 0, 0)
+        else:
+            user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+            for m in reversed(mod_vks):
+                user32.keybd_event(int(m), 0, KEYEVENTF_KEYUP, 0)
     except Exception:
-        logging.warning('合成听写快捷键失败', exc_info=True)
+        logging.warning('合成听写键 %s 失败', action, exc_info=True)
 
 
 def send_right_alt_tap():
@@ -177,6 +185,7 @@ class AudioPipe:
         self.closed = False
         self.packets = 0
         self.last_packet = 0
+        self.speech_event = threading.Event()  # 每收到一个音频帧置位（联动用）
         self.decoded_bytes = 0
         self.dropped_bytes = 0
         self.error = None
@@ -266,6 +275,7 @@ class AudioPipe:
         if frames:
             self.packets += 1
             self.last_packet = time.monotonic()
+            self.speech_event.set()
             try:
                 self.proc.stdin.write(b''.join(frames))
                 self.proc.stdin.flush()
@@ -330,6 +340,7 @@ class RemoteMic:
         self.test_stop = threading.Event()
         self.hotkey_enabled = load_dictation_enabled()  # 语音键联动开关
         self.hotkey = load_hotkey()                     # 听写快捷键（默认右Alt）
+        self._linkage_stop = threading.Event()
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -340,6 +351,7 @@ class RemoteMic:
 
     def stop(self):
         self.stop_event.set()
+        self._linkage_stop.set()
 
     def start_test(self):
         """测试输入：连接成功后可用。倒计时录音 → 保存 wav → 自动回放。"""
@@ -359,6 +371,7 @@ class RemoteMic:
             logging.exception('Remote connection failed')
             self.status('连接失败：' + str(exc) + '\n请按方向键唤醒遥控器，再点“连接”。')
         finally:
+            self._linkage_stop.set()
             self.connected = False
             if self.audio:
                 self.audio.close()
@@ -401,10 +414,11 @@ class RemoteMic:
                 await send(bytes([8, 6, 1]) + bytes(17))
                 self.status('已连接。请按住遥控器语音键说话。')
                 logging.info('READY')
+                self._linkage_stop.clear()
+                if self.hotkey_enabled:
+                    threading.Thread(target=self._linkage_watchdog, daemon=True).start()
                 last_packets = 0
                 active = False
-                was_speaking = False
-                last_hotkey = 0.0
                 while not self.stop_event.is_set() and client.is_connected:
                     if self.audio.error:
                         raise RuntimeError(self.audio.error)
@@ -420,17 +434,6 @@ class RemoteMic:
                         self.status('已连接，等待语音键。累计传输 %.1f 秒。'
                                     % (packets * .015))
                         active = False
-                    # 语音键联动：音频流的有无 = 语音键按下/松开，翻转时各敲一次右 Alt
-                    # 开关听写（适用于“按一次开始、再按一次结束”的听写工具）。
-                    if self.hotkey_enabled:
-                        now = time.monotonic()
-                        speaking = (now - self.audio.last_packet < 0.6
-                                    and packets > 0)
-                        if (speaking != was_speaking
-                                and now - last_hotkey >= 0.25):  # 250ms 去抖
-                            was_speaking = speaking
-                            last_hotkey = now
-                            send_dictation_tap(self.hotkey)
                     await asyncio.sleep(.5)
                 if not self.stop_event.is_set():
                     self.status('蓝牙连接已断开，请唤醒遥控器后重新连接。')
@@ -443,6 +446,28 @@ class RemoteMic:
                         await asyncio.sleep(.1)
                     except Exception:
                         logging.warning('Unable to send stop command', exc_info=True)
+
+    def _linkage_watchdog(self):
+        """语音键联动（真按住/真松开）：音频流开始 = 按下听写键；
+        静音 0.5 秒 = 松开；断连/停止时兜底松开，避免按键卡住。"""
+        holding = False
+        try:
+            while not self._linkage_stop.is_set():
+                audio = self.audio
+                if audio is None:
+                    break
+                got = audio.speech_event.wait(timeout=0.25)
+                if got:
+                    audio.speech_event.clear()
+                    if not holding and self.hotkey_enabled:
+                        send_dictation_key(self.hotkey, 'down')
+                        holding = True
+                elif holding and time.monotonic() - audio.last_packet >= 0.5:
+                    send_dictation_key(self.hotkey, 'up')
+                    holding = False
+        finally:
+            if holding:
+                send_dictation_key(self.hotkey, 'up')
 
     def _test_run(self):
         """从 CABLE Output 回环录制 5 秒（不中断主推流），存 wav 后自动回放。"""
@@ -573,8 +598,8 @@ def gui(addr=None):
     ttk.Checkbutton(hotkey_bar, text='语音键联动（按住说话自动开关听写）',
                     variable=hotkey_var, command=toggle_hotkey).pack(anchor='w')
     ttk.Label(hotkey_bar,
-              text='适用于「按一次开始、再按一次结束」的听写工具（如闪电说、豆包免按模式）；'
-                   '若使用长按式的语音工具请关闭本开关。',
+              text='按住语音键=按住听写键、松手=松开（配合闪电说「按住说话」等长按式听写）；'
+                   '若用「按一次开始、再按一次结束」型工具请关闭本开关。',
               style='Dim.TLabel', wraplength=520).pack(anchor='w', padx=(22, 0))
     hk_row = ttk.Frame(window)
     hk_row.pack(fill='x', padx=20, pady=(4, 0))
