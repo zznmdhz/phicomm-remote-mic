@@ -91,7 +91,28 @@ def save_dictation_enabled(value):
 
 VK_RMENU = 0xA5  # 右 Alt 虚拟键码
 KEYEVENTF_KEYUP = 0x0002
-DEFAULT_HOTKEY = {'mods': [], 'key': 'ralt', 'vk': VK_RMENU, 'mod_vks': []}
+KEYEVENTF_EXTENDEDKEY = 0x0001
+DEFAULT_HOTKEY = {'mods': [], 'key': 'lalt', 'vk': 0xA4, 'mod_vks': []}
+LINKAGE_SILENCE = 0.35
+LINKAGE_POLL = 0.025
+HOTKEY_HINT = '闪电说请选「按一次开始、再按一次结束」，语音键绑定：左Alt。'
+
+
+def valid_hotkey(hotkey):
+    """拒绝输入法处理键（229）、未定义键和损坏的配置。"""
+    return (isinstance(hotkey, dict)
+            and type(hotkey.get('vk')) is int
+            and 8 <= hotkey['vk'] <= 254
+            and hotkey['vk'] not in (0xE5, 0xE7, 0x5B, 0x5C)
+            and isinstance(hotkey.get('key'), str)
+            and bool(hotkey['key'])
+            and isinstance(hotkey.get('mods'), list)
+            and all(m in ('ctrl', 'alt', 'shift') for m in hotkey['mods'])
+            and isinstance(hotkey.get('mod_vks', []), list)
+            and len(hotkey.get('mod_vks', [])) == len(hotkey['mods'])
+            and all(type(v) is int and v in
+                    (0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5)
+                    for v in hotkey.get('mod_vks', [])))
 
 _KEYSYM_VK = {**{chr(c): c for c in range(ord('a'), ord('z') + 1)},
               **{str(d): 0x30 + d for d in range(10)},
@@ -116,12 +137,11 @@ def keysym_to_vk(keysym):
 
 
 def load_hotkey():
-    """读取自定义听写快捷键；缺失/损坏返回默认（右Alt）。"""
+    """读取自定义听写快捷键；缺失/损坏返回默认（左Alt）。"""
     hk = load_config().get('hotkey')
-    if (isinstance(hk, dict) and isinstance(hk.get('vk'), int)
-            and isinstance(hk.get('mods'), list) and 'key' in hk):
+    if valid_hotkey(hk):
         return hk
-    return dict(DEFAULT_HOTKEY)
+    return {**DEFAULT_HOTKEY, 'mods': [], 'mod_vks': []}
 
 
 def save_hotkey(hotkey):
@@ -137,33 +157,47 @@ def describe_hotkey(hotkey):
     return ''.join(parts) + alias.get(key, key)
 
 
-def send_dictation_tap(hotkey):
-    """按配置合成一次听写快捷键点按（修饰键 down → 主键 down/up → 修饰键 up）。"""
-    send_dictation_key(hotkey, 'down')
-    send_dictation_key(hotkey, 'up')
+def send_dictation_tap(hotkey, verify=False):
+    """短点按；自检用 GetAsyncKeyState 高位观察所有组合键，始终释放按键。"""
+    if not valid_hotkey(hotkey):
+        raise ValueError('听写快捷键无效，请重新设置。')
+    keys = list(hotkey.get('mod_vks', [])) + [hotkey['vk']]
+    user32 = ctypes.windll.user32
+    if verify and any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in keys):
+        raise RuntimeError('请先松开键盘上的听写快捷键，再运行自检。')
+    seen = set()
+    try:
+        send_dictation_key(hotkey, 'down')
+        deadline = time.monotonic() + 0.06
+        while True:
+            if verify:
+                seen.update(vk for vk in keys if user32.GetAsyncKeyState(vk) & 0x8000)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.005, remaining))
+    finally:
+        send_dictation_key(hotkey, 'up')
+    return len(seen) == len(set(keys)) if verify else True
 
 
 def send_dictation_key(hotkey, action):
-    """按配置按下('down')/抬起('up')听写键——真按住/真松开，配合长按式听写。"""
-    try:
-        user32 = ctypes.windll.user32
-        mod_vks = hotkey.get('mod_vks') or []
-        vk = int(hotkey['vk'])
-        if action == 'down':
-            for m in mod_vks:
-                user32.keybd_event(int(m), 0, 0, 0)
-            user32.keybd_event(vk, 0, 0, 0)
-        else:
-            user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-            for m in reversed(mod_vks):
-                user32.keybd_event(int(m), 0, KEYEVENTF_KEYUP, 0)
-    except Exception:
-        logging.warning('合成听写键 %s 失败', action, exc_info=True)
+    """发送完整键序列，右 Ctrl/Alt、方向键等保留扩展键标记。"""
+    keys = list(hotkey.get('mod_vks') or []) + [int(hotkey['vk'])]
+    if action == 'up':
+        keys.reverse()
+    for vk in keys:
+        extended = vk in (0xA3, 0xA5, 0x21, 0x22, 0x23, 0x24,
+                          0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E)
+        flags = KEYEVENTF_EXTENDEDKEY if extended else 0
+        if action == 'up':
+            flags |= KEYEVENTF_KEYUP
+        ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
 
 
 def send_right_alt_tap():
     """兼容保留：默认右Alt 点按。"""
-    send_dictation_tap(DEFAULT_HOTKEY)
+    send_dictation_tap({'mods': [], 'mod_vks': [], 'key': 'ralt', 'vk': VK_RMENU})
 
 
 async def scan_remote(status, timeout=8.0):
@@ -339,10 +373,42 @@ class RemoteMic:
         self.test_running = False
         self.test_stop = threading.Event()
         self.hotkey_enabled = load_dictation_enabled()  # 语音键联动开关
-        self.hotkey = load_hotkey()                     # 听写快捷键（默认右Alt）
+        self.hotkey = load_hotkey()                     # 听写快捷键（默认左Alt）
         self._linkage_stop = threading.Event()
+        self._linkage_thread = None
+        self.hotkey_test_thread = None
+
+    def start_hotkey_test(self):
+        """断开连接时自检，成对点按避免听写留在开启状态。"""
+        if ((self.thread and self.thread.is_alive())
+                or (self.hotkey_test_thread and self.hotkey_test_thread.is_alive())):
+            return
+        hotkey = {**self.hotkey, 'mod_vks': list(self.hotkey.get('mod_vks', []))}
+        def run():
+            started = False
+            try:
+                self.status('联动自检：发送开始/结束两次点按，请观察听写工具。')
+                visible = send_dictation_tap(hotkey, verify=True)
+                started = True
+                time.sleep(0.7)
+                started = False
+                visible = send_dictation_tap(hotkey, verify=True) and visible
+                if visible:
+                    self.status('自检：系统已观察到快捷键。若听写未响应，请核对闪电说绑定、模式和权限。')
+                else:
+                    self.status('自检：系统未观察到完整快捷键，可能被拦截。请改用左Alt，且两边绑定一致。')
+            except Exception as exc:
+                logging.exception('Hotkey self-test failed')
+                self.status('联动自检失败：' + str(exc))
+            finally:
+                if started:
+                    send_dictation_tap(hotkey)
+        self.hotkey_test_thread = threading.Thread(target=run, daemon=True)
+        self.hotkey_test_thread.start()
 
     def start(self):
+        if self.hotkey_test_thread and self.hotkey_test_thread.is_alive():
+            return
         if self.thread and self.thread.is_alive():
             return
         self.stop_event.clear()
@@ -372,6 +438,8 @@ class RemoteMic:
             self.status('连接失败：' + str(exc) + '\n请按方向键唤醒遥控器，再点“连接”。')
         finally:
             self._linkage_stop.set()
+            if self._linkage_thread:
+                self._linkage_thread.join()
             self.connected = False
             if self.audio:
                 self.audio.close()
@@ -412,11 +480,11 @@ class RemoteMic:
                 await asyncio.sleep(.3)
                 await send(bytes([8, 12]) + bytes(4) + bytes([1]) + bytes(13))
                 await send(bytes([8, 6, 1]) + bytes(17))
-                self.status('已连接。请按住遥控器语音键说话。')
+                self.status('已连接。请按住遥控器语音键说话。\n' + HOTKEY_HINT)
                 logging.info('READY')
                 self._linkage_stop.clear()
-                if self.hotkey_enabled:
-                    threading.Thread(target=self._linkage_watchdog, daemon=True).start()
+                self._linkage_thread = threading.Thread(target=self._linkage_watchdog, daemon=True)
+                self._linkage_thread.start()
                 last_packets = 0
                 active = False
                 while not self.stop_event.is_set() and client.is_connected:
@@ -448,26 +516,37 @@ class RemoteMic:
                         logging.warning('Unable to send stop command', exc_info=True)
 
     def _linkage_watchdog(self):
-        """语音键联动（真按住/真松开）：音频流开始 = 按下听写键；
-        静音 0.5 秒 = 松开；断连/停止时兜底松开，避免按键卡住。"""
-        holding = False
+        """语音键联动（双点按）：音频流开始 = 敲一下听写键（开始听写），
+        静音 0.35 秒 = 再敲一下（结束听写）。配合「按一次开始、再按一次结束」的听写工具。"""
+        active_hotkey = None
+        def finish():
+            nonlocal active_hotkey
+            hotkey, active_hotkey = active_hotkey, None
+            if hotkey is not None:
+                send_dictation_tap(hotkey)
         try:
             while not self._linkage_stop.is_set():
                 audio = self.audio
                 if audio is None:
                     break
-                got = audio.speech_event.wait(timeout=0.25)
+                got = audio.speech_event.wait(timeout=LINKAGE_POLL)
                 if got:
                     audio.speech_event.clear()
-                    if not holding and self.hotkey_enabled:
-                        send_dictation_key(self.hotkey, 'down')
-                        holding = True
-                elif holding and time.monotonic() - audio.last_packet >= 0.5:
-                    send_dictation_key(self.hotkey, 'up')
-                    holding = False
+                if self._linkage_stop.is_set():
+                    break
+                if active_hotkey is not None and (not self.hotkey_enabled
+                        or time.monotonic() - audio.last_packet >= LINKAGE_SILENCE):
+                    finish()
+                elif (got and active_hotkey is None and self.hotkey_enabled
+                      and time.monotonic() - audio.last_packet < LINKAGE_SILENCE):
+                    hotkey = {**self.hotkey, 'mod_vks': list(self.hotkey.get('mod_vks', []))}
+                    send_dictation_tap(hotkey)
+                    active_hotkey = hotkey
+        except Exception as exc:
+            logging.exception('Dictation linkage failed')
+            self.status('听写联动失败：' + str(exc))
         finally:
-            if holding:
-                send_dictation_key(self.hotkey, 'up')
+            finish()  # 已开始的听写，即使关闭联动或修改快捷键，也用原键结束。
 
     def _test_run(self):
         """从 CABLE Output 回环录制 5 秒（不中断主推流），存 wav 后自动回放。"""
@@ -540,7 +619,7 @@ def gui(addr=None):
         window.iconbitmap(str(ROOT / 'icon.ico'))
     except Exception:
         pass
-    window.geometry('580x580')
+    window.geometry('580x640')
     window.resizable(False, False)
     # ---- 深色工作台主题：纯 tkinter/ttk，零额外依赖 ----
     BG, CARD, FG, DIM, ACCENT, GREEN, ERR = ('#17171a', '#212126', '#e8e8ea',
@@ -598,9 +677,11 @@ def gui(addr=None):
     ttk.Checkbutton(hotkey_bar, text='语音键联动（按住说话自动开关听写）',
                     variable=hotkey_var, command=toggle_hotkey).pack(anchor='w')
     ttk.Label(hotkey_bar,
-              text='按住语音键=按住听写键、松手=松开（配合闪电说「按住说话」等长按式听写）；'
-                   '若用「按一次开始、再按一次结束」型工具请关闭本开关。',
+              text='配合「按一次开始、再按一次结束」的听写工具（如闪电说）：'
+                   '按下语音键=开始，松开约0.35秒后结束。',
               style='Dim.TLabel', wraplength=520).pack(anchor='w', padx=(22, 0))
+    ttk.Label(hotkey_bar, text=HOTKEY_HINT + '\n本机曾出现右Alt注入被拦截，推荐左Alt。',
+              style='Hint.TLabel', wraplength=520).pack(anchor='w', padx=(22, 0))
     hk_row = ttk.Frame(window)
     hk_row.pack(fill='x', padx=20, pady=(4, 0))
     ttk.Label(hk_row, text='听写快捷键：').pack(side='left')
@@ -616,7 +697,7 @@ def gui(addr=None):
         dlg.grab_set()
         ttk.Label(dlg,
                   text='按下组合键（如 Ctrl+Alt+D、Shift+空格、F9），\n'
-                       '或只按一个修饰键（右Alt / 左Ctrl）后松开即可单独使用。\n'
+                       '或只按一个修饰键（推荐左Alt）后松开即可单独使用。\n'
                        '（Win 键暂不支持）',
                   style='Dim.TLabel', wraplength=350,
                   justify='center').pack(pady=(12, 6))
@@ -666,8 +747,8 @@ def gui(addr=None):
                 mods.append('shift'); mod_vks.append(0x10)
             code = getattr(e, 'keycode', None)
             vk = code if isinstance(code, int) and 8 <= code <= 254 else keysym_to_vk(key)
-            if not vk:
-                msg.configure(text='这个键暂不支持，换一个试试', foreground=ERR)
+            if not vk or vk in (0xE5, 0xE7):
+                msg.configure(text='请切换英文输入法后重试（不能使用输入法处理键）', foreground=ERR)
                 return
             save({'mods': mods, 'mod_vks': mod_vks, 'key': key, 'vk': int(vk)})
 
@@ -682,6 +763,10 @@ def gui(addr=None):
         dlg.bind('<KeyRelease>', on_release)
         dlg.focus_force()
     ttk.Button(hk_row, text='自定义…', command=open_hotkey_dialog).pack(side='left')
+    linkage_test = ttk.Button(hk_row, text='联动自检', command=app.start_hotkey_test)
+    linkage_test.pack(side='left', padx=8)
+    ttk.Label(window, text='断开连接后可自检：会自动发送开始/结束两次快捷键。',
+              style='Dim.TLabel').pack(anchor='w', padx=42, pady=(2, 0))
     ttk.Separator(window, orient='horizontal').pack(fill='x', padx=16, pady=8)
     record_bar = ttk.Frame(window)
     record_bar.pack(fill='x', padx=16)
@@ -743,12 +828,14 @@ def gui(addr=None):
                 color = DIM
             label.configure(text=text, foreground=color)
         running = bool(app.thread and app.thread.is_alive())
-        start.configure(state='disabled' if running or closing else 'normal')
+        checking = bool(app.hotkey_test_thread and app.hotkey_test_thread.is_alive())
+        start.configure(state='disabled' if running or checking or closing else 'normal')
+        linkage_test.configure(state='disabled' if running or checking or closing else 'normal')
         test.configure(state='normal' if (app.connected and not app.test_running) else 'disabled')
         if record_dirty[0]:
             record_dirty[0] = False
             refresh_recordings()
-        if closing and not running:
+        if closing and not running and not checking:
             window.destroy()
         else:
             window.after(150, poll)
