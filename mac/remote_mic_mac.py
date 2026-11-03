@@ -49,6 +49,7 @@ RX_UUID = "00002b00-0000-1000-8000-00805f9b34fb"
 TX_UUID = "00002b01-0000-1000-8000-00805f9b34fb"
 RATE = 48000
 CHANNELS = 2
+VOICE_RMS = 300          # 解码后 PCM 的 RMS 阈值：高于它算「有声音」，用来判断说完
 
 # macOS 虚拟键码（供听写键选择）
 HOTKEY_CHOICES = [
@@ -108,6 +109,7 @@ class AudioPipe:
         self.lock = threading.Lock()
         self.frames = 0
         self.last_packet = 0.0
+        self.last_voice = 0.0        # 最近一次「确实有声音」的时间（RMS 超阈值）
         self.speech_event = threading.Event()
         self.error = None
         self.fragment = bytearray(120)
@@ -137,6 +139,12 @@ class AudioPipe:
                 data = self.proc.stdout.read(1920)
                 if not data:
                     break
+                try:                        # 有声音才更新，静音包不算
+                    import audioop
+                    if audioop.rms(data, 2) > VOICE_RMS:
+                        self.last_voice = time.monotonic()
+                except Exception:
+                    pass
                 with self.lock:
                     self.buffer.extend(data)
                     if self.rec_buffer is not None:
@@ -483,17 +491,25 @@ class RemoteMic:
         while not self.linkage_stop.is_set() and gen == self.linkage_gen:
             audio = self.audio
             if audio is None:
+                if speaking:                                    # 音频管线没了：立刻松手
+                    release_hotkey(self.hotkey, owner="link")
+                    speaking = False
                 time.sleep(0.2)
                 continue
-            got = audio.speech_event.wait(timeout=0.2)
+            got = audio.speech_event.wait(timeout=0.15)
             if got:
                 audio.speech_event.clear()
                 if not speaking:
                     if press_hotkey(self.hotkey, owner="link"):   # 开口就按住听写键
                         speaking = True
-            elif speaking and time.monotonic() - audio.last_packet >= 0.5:
-                release_hotkey(self.hotkey, owner="link")         # 0.5 秒没声音 = 说完了
-                speaking = False
+            if speaking:
+                now = time.monotonic()
+                # 三层兜底，任一层满足就松手：绝不能把 Shift 卡在按下状态
+                idle_for = now - audio.last_packet                  # 连音频包都不来了
+                quiet_for = now - max(audio.last_voice, audio.last_packet)  # 有包但静音
+                if idle_for >= 0.5 or quiet_for >= 0.7:
+                    release_hotkey(self.hotkey, owner="link")     # 说完了
+                    speaking = False
         if speaking:
             release_hotkey(self.hotkey, owner="link")
         log("[link] 循环结束 gen=%d" % gen)
