@@ -31,3 +31,6 @@ kill2.txt
 uia-dump.txt
 inst-check.txt
 app/kill2.txt
+
+# macOS app bundle（由 launch_mic.sh + osacompile 生成，不入库）
+*.app
