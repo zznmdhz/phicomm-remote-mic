@@ -278,6 +278,7 @@ class RemoteMic:
         self.dictation_enabled = bool(self.cfg.get("dictation_enabled", True))
         self.linkage_thread = None
         self.linkage_stop = threading.Event()
+        self.linkage_gen = 0
         self.last_uuid = self.cfg.get("peripheral_uuid")
 
     # ---- 生命周期 ----
@@ -316,11 +317,19 @@ class RemoteMic:
     def stop(self):
         self.stop_event.set()
         self.linkage_stop.set()
+        th = self.linkage_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=1.5)
+        self.linkage_thread = None
+        release_hotkey(self.hotkey, owner="link")     # 停就保证松手，别把 Shift 卡住
         try:
             if self.manager is not None:
                 self.manager.stopScan()
+                if self.peripheral is not None:
+                    self.manager.cancelPeripheralConnection_(self.peripheral)
         except Exception:
             pass
+        self.peripheral = None
         audio, self.audio = self.audio, None
         if audio is not None:
             audio.close()
@@ -454,15 +463,24 @@ class RemoteMic:
 
     # ---- 听写键联动 ----
     def _start_linkage(self):
-        if not self.dictation_enabled or self.linkage_thread:
+        if not self.dictation_enabled:
+            log("[link] 联动未勾选，不启动")
+            return
+        th = self.linkage_thread
+        if th is not None and th.is_alive():
+            log("[link] 联动线程已在运行，不重复启动")
             return
         self.linkage_stop.clear()
-        self.linkage_thread = threading.Thread(target=self._linkage_loop, daemon=True)
+        self.linkage_gen += 1
+        gen = self.linkage_gen
+        self.linkage_thread = threading.Thread(target=self._linkage_loop, args=(gen,), daemon=True)
         self.linkage_thread.start()
+        log("[link] 联动线程启动 gen=%d" % gen)
 
-    def _linkage_loop(self):
+    def _linkage_loop(self, gen):
         speaking = False
-        while not self.linkage_stop.is_set():
+        log("[link] 循环开始 gen=%d" % gen)
+        while not self.linkage_stop.is_set() and gen == self.linkage_gen:
             audio = self.audio
             if audio is None:
                 time.sleep(0.2)
@@ -471,13 +489,14 @@ class RemoteMic:
             if got:
                 audio.speech_event.clear()
                 if not speaking:
-                    tap_hotkey(self.hotkey)
-                    speaking = True
-            elif speaking and time.monotonic() - audio.last_packet >= 0.35:
-                tap_hotkey(self.hotkey)
+                    if press_hotkey(self.hotkey, owner="link"):   # 开口就按住听写键
+                        speaking = True
+            elif speaking and time.monotonic() - audio.last_packet >= 0.5:
+                release_hotkey(self.hotkey, owner="link")         # 0.5 秒没声音 = 说完了
                 speaking = False
         if speaking:
-            tap_hotkey(self.hotkey)
+            release_hotkey(self.hotkey, owner="link")
+        log("[link] 循环结束 gen=%d" % gen)
 
     # ---- 测试录音：从 BlackHole 回环录 ----
     def record(self, seconds=5, path=None):
@@ -502,17 +521,164 @@ class RemoteMic:
         return path
 
 
-def tap_hotkey(keycode):
-    """用 Quartz 合成一次按键点按（需要辅助功能权限）。"""
+# 修饰键必须连 mask 一起发：闪电说这类工具监听的是 FlagsChanged，
+# 只发 keyDown/keyUp 而不带 NX_DEVICExxxKEYMASK，会被当成"没按修饰键"。
+# (kCGEventFlagMaskShift, NX_DEVICE*KEYMASK)
+MOD_FLAGS = {
+    56: (0x00020000, 0x00000002),   # 左 Shift
+    60: (0x00020000, 0x00000004),   # 右 Shift
+    58: (0x00080000, 0x00000020),   # 左 Option
+    61: (0x00080000, 0x00000040),   # 右 Option
+}
+
+_hk_lock = threading.Lock()
+_hk_down = False          # 全局唯一的「按键是否处于按下状态」
+_hk_owner = None          # 谁按下的：link=联动，test=试一下
+
+
+def _post_hotkey(keycode, down):
+    """合成修饰键状态变化。显式发 flagsChanged，和真键盘一致：
+    只发 keyDown 时，某些情况下系统不会转成 flagsChanged，监听 FlagsChanged 的工具就收不到。"""
+    import Quartz
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    ev = Quartz.CGEventCreateKeyboardEvent(src, keycode, down)
+    mask = 0
+    if down and keycode in MOD_FLAGS:
+        base, device = MOD_FLAGS[keycode]
+        mask = base | device
+    Quartz.CGEventSetFlags(ev, mask)
+    try:
+        Quartz.CGEventSetType(ev, Quartz.kCGEventFlagsChanged)
+    except Exception:
+        pass
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    return mask
+
+
+def _shift_stuck():
+    """系统层面是否还残留着 Shift 按下状态（上一个进程没松手就会这样）。"""
     try:
         import Quartz
-        src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
-        for down in (True, False):
-            ev = Quartz.CGEventCreateKeyboardEvent(src, keycode, down)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-        log("[hotkey] tap", keycode)
+        f = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
+        return bool((f >> 17) % 2)
+    except Exception:
+        return False
+
+
+def force_clear_modifier(keycode):
+    """把可能卡住的修饰键复位：发一个 flags=0 的松开。"""
+    try:
+        _post_hotkey(keycode, False)
+        log("[hotkey] 已清理残留修饰键状态")
     except Exception as exc:
-        log("[hotkey] 合成失败:", exc)
+        log("[hotkey] 清理失败:", exc)
+
+
+def press_hotkey(keycode, owner="link"):
+    """按下并保持。已经按住时不重复发——重复的 keyDown 会让听写工具状态错乱。"""
+    global _hk_down, _hk_owner
+    with _hk_lock:
+        if _hk_down:
+            log("[hotkey] 已按住中，跳过重复按下 owner=%s" % _hk_owner)
+            return False
+        if _shift_stuck():
+            # 上一次（别的进程或崩溃）没把 Shift 松开 -> 现在再按不会有状态变化，工具收不到
+            log("[hotkey] 检测到系统里 Shift 还按着，先复位")
+            force_clear_modifier(keycode)
+            time.sleep(0.05)
+        try:
+            mask = _post_hotkey(keycode, True)
+        except Exception as exc:
+            log("[hotkey] 按下失败:", exc)
+            return False
+        _hk_down, _hk_owner = True, owner
+        log("[hotkey] press", keycode, "flags=0x%08x" % mask, "owner=" + owner)
+        return True
+
+
+def release_hotkey(keycode, owner="link"):
+    """松开。只允许「按下它的那个人」松手，防止两处互相打断。"""
+    global _hk_down, _hk_owner
+    with _hk_lock:
+        if not _hk_down:
+            return False
+        if _hk_owner != owner:
+            log("[hotkey] 跳过松开：当前按住的是", _hk_owner)
+            return False
+        try:
+            _post_hotkey(keycode, False)
+        except Exception as exc:
+            log("[hotkey] 松开失败:", exc)
+        _hk_down, _hk_owner = False, None
+        log("[hotkey] release", keycode)
+        return True
+
+
+def hotkey_is_down():
+    return _hk_down
+
+
+def tap_hotkey(keycode, hold=0.35):
+    """自检用：按下-保持-松开。联动正按住时直接跳过，绝不打断正在进行的录音。"""
+    if not press_hotkey(keycode, owner="test"):
+        log("[hotkey] 联动正在按住按键，测试跳过")
+        return
+    time.sleep(hold)
+    release_hotkey(keycode, owner="test")
+
+
+# ---------------------------------------------------------------- 按键守卫
+# 遥控器的语音键在系统里同时是一只 HID 键盘键：按住时会以 ~12 次/秒自动重复 F5。
+# 这些 keyDown 会被听写工具当成"你在打字"，于是它把合成出来的 RShift 判为卡键并清掉，
+# 长按录音于是只维持几百毫秒。这里在会话层把这些事件吞掉（只在遥控器连着的时候有意义）。
+SWALLOW_KEYCODES = {96}          # 96 = F5，斐讯遥控器语音键的键码
+_guard_stat = {"dropped": 0}
+
+
+def start_key_guard(enabled=True):
+    if not enabled:
+        log("[guard] 未启用按键守卫")
+        return None
+    try:
+        import Quartz
+    except Exception as exc:
+        log("[guard] 没有 Quartz，跳过:", exc)
+        return None
+
+    def cb(proxy, etype, event, refcon):
+        try:
+            if etype == Quartz.kCGEventTapDisabledByTimeout:
+                Quartz.CGEventTapEnable(refcon, True)
+                return event
+            if etype in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
+                kc = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                pid = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUnixProcessID)
+                if kc in SWALLOW_KEYCODES and pid == 0:      # pid=0 才是真硬件
+                    _guard_stat["dropped"] += 1
+                    n = _guard_stat["dropped"]
+                    if n in (1, 30) or n % 100 == 0:
+                        log("[guard] 已拦截遥控器语音键 F5 连发 ×%d" % n)
+                    return None
+        except Exception as exc:
+            log("[guard] 回调异常:", exc)
+        return event
+
+    mask = (1 << Quartz.kCGEventKeyDown) | (1 << Quartz.kCGEventKeyUp)
+    tap = Quartz.CGEventTapCreate(Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
+                                  Quartz.kCGEventTapOptionDefault, mask, cb, None)
+    if not tap:
+        log("[guard] 创建事件过滤器失败（可能缺辅助功能权限），F5 连发不会被拦截")
+        return None
+
+    def run():
+        src = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(tap, True)
+        Quartz.CFRunLoopRun()
+
+    threading.Thread(target=run, daemon=True).start()
+    log("[guard] 已启用：拦截遥控器语音键的 F5 连发")
+    return tap
 
 
 # ---------------------------------------------------------------- 自检
@@ -587,6 +753,7 @@ def gui():
         messages.append(text)
 
     mic = RemoteMic(status=status)
+    start_key_guard(bool(mic.cfg.get("guard_remote_f5", True)))
 
     ttk.Label(win, text="斐讯遥控器 → 无线麦克风", style="Title.TLabel").pack(pady=(18, 8))
     label = ttk.Label(win, text="点「连接」，然后按遥控器任意键唤醒它。",
@@ -594,6 +761,8 @@ def gui():
     label.pack(pady=4)
     meter = ttk.Label(win, text="音频帧 0  ·  0.0 秒", style="Status.TLabel")
     meter.pack(pady=(0, 2))
+    link_lbl = ttk.Label(win, text="联动：待机", style="Status.TLabel")
+    link_lbl.pack(pady=(0, 2))
 
     btns = ttk.Frame(win)
     btns.pack(pady=10)
@@ -611,7 +780,7 @@ def gui():
 
     ttk.Checkbutton(win, text="语音键联动（按下语音键=开始听写，松开=结束）",
                     variable=hk_var, command=toggle_dictation).pack(anchor="w", padx=24)
-    ttk.Label(win, text="配合「按一次开始、再按一次结束」的听写工具（如闪电说），把它的语音键设成下面这个键。",
+    ttk.Label(win, text="听写工具里把语音键设成下面这个键即可（闪电说：长按说话模式）；联动会在你开口时按住它、说完松开。",
               style="Dim.TLabel", wraplength=560).pack(anchor="w", padx=44)
 
     row = ttk.Frame(win)
@@ -634,7 +803,7 @@ def gui():
     hk_combo.bind("<<ComboboxSelected>>", on_hotkey_change)
 
     def test_tap():
-        tap_hotkey(mic.hotkey)
+        tap_hotkey(mic.hotkey, hold=1.2)       # 长按 1.2 秒，能验出「长按触发」型工具是否响应
         status("已发送一次听写键（若听写没反应：系统设置→隐私与安全→辅助功能，允许「终端」）")
 
     ttk.Button(row, text="试一下", command=test_tap).pack(side="left")
@@ -703,7 +872,33 @@ def gui():
 
     test_btn.configure(command=do_test)
 
+    debug_hook = os.environ.get("N1_DEBUG_HOOK") == "1"
+    debug_path = os.environ.get("N1_DEBUG_CMD", "/tmp/n1_linkage_cmd")
+    debug_seen = [""]
+
+    def _debug_poll():
+        if not debug_hook:
+            return
+        try:
+            cmd = open(debug_path, encoding="utf-8").read().strip()
+        except Exception:
+            return
+        if not cmd or cmd == debug_seen[0]:
+            return
+        debug_seen[0] = cmd
+        log("[debug] 收到指令", cmd)
+        if cmd == "press":
+            press_hotkey(mic.hotkey, owner="debug")
+        elif cmd == "release":
+            release_hotkey(mic.hotkey, owner="debug")
+        elif cmd == "clear":
+            force_clear_modifier(mic.hotkey)
+
     def poll():
+        _debug_poll()
+        down = hotkey_is_down()
+        link_lbl.configure(text=("联动：已按住听写键" if down else "联动：待机"),
+                           foreground=(ACCENT if down else DIM))
         while messages:
             text = messages.pop(0)
             color = GREEN if ("已连接" in text or "已开流" in text) else (

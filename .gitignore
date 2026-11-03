@@ -22,6 +22,7 @@ services.json
 
 # 本地配置
 app/config.json
+mac/config.json
 python/
 lnk-check.txt
 pw-*.txt
