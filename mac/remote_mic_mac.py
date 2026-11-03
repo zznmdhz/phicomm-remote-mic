@@ -772,7 +772,7 @@ def gui():
     start_key_guard(bool(mic.cfg.get("guard_remote_f5", True)))
 
     ttk.Label(win, text="斐讯遥控器 → 无线麦克风", style="Title.TLabel").pack(pady=(18, 8))
-    label = ttk.Label(win, text="点「连接」，然后按遥控器任意键唤醒它。",
+    label = ttk.Label(win, text="正在自动连接……遥控器休眠时按一下任意键唤醒它。",
                       style="Status.TLabel", wraplength=560, justify="center")
     label.pack(pady=4)
     meter = ttk.Label(win, text="音频帧 0  ·  0.0 秒", style="Status.TLabel")
@@ -929,6 +929,7 @@ def gui():
 
     refresh_list()
     poll()
+    win.after(300, mic.start)        # 打开即自动连接，不用再手点「连接」
     win.mainloop()
     mic.stop()
 
