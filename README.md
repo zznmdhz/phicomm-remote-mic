@@ -1,6 +1,6 @@
 # phicomm-remote-mic
 
-把斐讯 N1 / DB1-R 蓝牙语音遥控器变成 Windows 无线麦克风，喂给 AI 应用（Codex / Claude / 微信语音输入等）——不用买麦克风，也不需要 N1 盒子或官方 App。
+把斐讯 N1 / DB1-R 蓝牙语音遥控器变成 Windows / macOS 无线麦克风，喂给 AI 应用（Codex / Claude / 微信语音输入、闪电说、系统听写等）——不用买麦克风，也不需要 N1 盒子或官方 App。
 
 ## 效果
 
@@ -65,6 +65,45 @@
 
 离线回归检查：`app\python\python.exe tools\test_linkage.py`。
 
+## macOS 版
+
+`mac/` 目录是 macOS 端口，协议层与 Windows 完全一致，只换了传输与虚拟声卡：
+
+| 环节 | Windows | macOS |
+| --- | --- | --- |
+| BLE | WinRT GATT | CoreBluetooth（PyObjC），必须用 `retrieveConnectedPeripheralsWithServices` 才能拿到「已连接但不广播」的遥控器 |
+| 回调线程 | asyncio | GCD 队列（走主 RunLoop 会和界面抢线程，导致音频断续） |
+| 解码 | 系统 ffmpeg | `imageio-ffmpeg` 自带静态 ffmpeg，免安装 |
+| 虚拟声卡 | VB-CABLE → `CABLE Output` | BlackHole 2ch（仓库内附 `BlackHole2ch-0.7.1.pkg`） |
+| 听写按键 | Windows VK → `SendInput` | macOS 键码 → `CGEventPost`（需辅助功能权限） |
+
+安装与用法见 [mac/使用说明.md](mac/使用说明.md)，一句话：
+
+```bash
+cd mac
+python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+./启动遥控器麦克风.command
+```
+
+无界面自检（会弹系统对话框提示你按语音键，录完自动回放）：
+
+```bash
+./venv/bin/python remote_mic_mac.py --selftest 5 --prompt
+```
+
+macOS 实测结果：`retrieveConnectedPeripheralsWithServices` 直连已配对遥控器成功，
+握手三连全部应答，连续收到 120 字节 mSBC 音频包，解码后 16 kHz 转写可辨认
+（「一二三 开始 说话 五秒钟 你 听到 了」）。真实使用时按住语音键说话即入
+BlackHole，语音输入法选 `BlackHole 2ch` 即可听写。
+
+### macOS 排错速查
+
+- **`BLE is not authorized`**：通过 SSH 跑 BLE 会被 TCC 拦；必须在图形界面的「终端」里运行并允许蓝牙权限。
+- **`bleak` 扫不到遥控器**：设备已被系统连接、不广播；用本程序的 CoreBluetooth 路径，别用扫描。
+- **音频一卡一卡**：说明蓝牙回调被放在主线程/界面循环里，改 GCD 队列。
+- **合成按键没反应**：系统设置 → 隐私与安全性 → 辅助功能，允许运行程序的「终端」。
+- **听写工具收不到声音**：麦克风必须选 `BlackHole 2ch`；设备名要一字不差。
+
 ## 项目结构
 
 | 路径 | 说明 |
@@ -73,6 +112,7 @@
 | `tools/` | 辅助脚本（抓包、环回/实录测试等） |
 | `docs/PROTOCOL.md` | Kehwin 私有语音协议完整文档（服务表、命令表、帧格式） |
 | `docs/RESEARCH.md` | 协议逆向的研究过程、负结果与复盘 |
+| `mac/` | macOS 版：CoreBluetooth 采集 + BlackHole 虚拟声卡 + tkinter 界面 + 自检脚本 |
 | `requirements.txt` | Python 依赖（另需系统级 ffmpeg 与 VB-CABLE） |
 | `LICENSE` | MIT |
 
@@ -86,7 +126,8 @@
 
 - 仅在 **DB1-R**（斐讯 N1 语音遥控器，固件 `RTL_618_V0001`，软件版本 `100011_201908241450`）上完成真机端到端验证。
 - 其他使用 Kehwin 方案（同一 APK `KehwinBLE.apk` + `libmbleRuntime.so`）的遥控器**理论上兼容，但未验证**，本仓库不承诺任何未列出的型号。
-- 仅支持 **Windows**（依赖 VB-CABLE 与 WASAPI）。
+- 支持 **Windows**（VB-CABLE + WASAPI）与 **macOS**（BlackHole 2ch + CoreAudio，已在 macOS 27.0.1 / Apple Silicon 实测）。
+- macOS 端同样只在这台 DB1-R（固件 `RTL_618_V0001`）上做过真机验证。
 
 ## 致谢
 

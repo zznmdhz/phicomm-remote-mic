@@ -1,0 +1,7 @@
+bleak>=0.22
+sounddevice>=0.4.6
+pyobjc-core
+pyobjc-framework-CoreBluetooth
+pyobjc-framework-Quartz
+pyobjc-framework-libdispatch
+imageio-ffmpeg
