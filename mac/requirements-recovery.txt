@@ -1,0 +1,9 @@
+audioop-lts==0.2.2
+cffi==2.1.1
+pycparser==3.12
+pyobjc-core==13.0
+pyobjc-framework-cocoa==13.0
+pyobjc-framework-corebluetooth==13.0
+pyobjc-framework-libdispatch==13.0
+pyobjc-framework-quartz==13.0
+sounddevice==0.5.6

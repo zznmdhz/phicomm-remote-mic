@@ -1,5 +1,7 @@
 # phicomm-remote-mic
 
+> **2026-11-15 macOS 源码恢复候选：**更新了蓝牙扫描、退出关流和运行目录配置。macOS 仍需 BlackHole、FFmpeg、Python/Tk、蓝牙权限；只有使用快捷键联动时才需要辅助功能。这个分支不附安装包。微信输入法纯右 Shift 仍待实机确认，不能把已握手、已开流等同为听写过关。详见 [更新日志](CHANGELOG.md) 和 [macOS 恢复说明](mac/RECOVERY.md)。下文的 VB-CABLE 说明适用于 Windows。
+
 把斐讯 N1 / DB1-R 蓝牙语音遥控器变成 Windows / macOS 无线麦克风，喂给 AI 应用（Codex / Claude / 微信语音输入、闪电说、系统听写等）——不用买麦克风，也不需要 N1 盒子或官方 App。
 
 ## 效果

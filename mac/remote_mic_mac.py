@@ -38,11 +38,16 @@ try:
     FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:                                    # 退回到系统 ffmpeg
     FFMPEG = "ffmpeg"
+FFMPEG = os.environ.get("N1_FFMPEG", FFMPEG)
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config.json"
-REC_DIR = ROOT / "recordings"
-LOG_PATH = ROOT / "remote-mic.log"
+DATA_DIR = Path(os.environ.get("N1_DATA_DIR", str(ROOT)))
+LOG_DIR = Path(os.environ.get("N1_LOG_DIR", str(DATA_DIR)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_PATH = DATA_DIR / "config.json"
+REC_DIR = DATA_DIR / "recordings"
+LOG_PATH = LOG_DIR / "remote-mic.log"
 
 VOICE_SVC = "00001920-0000-1000-8000-00805f9b34fb"
 RX_UUID = "00002b00-0000-1000-8000-00805f9b34fb"
@@ -262,6 +267,9 @@ class BleDelegate(NSObject):
     def peripheral_didWriteValueForCharacteristic_error_(self, p, ch, err):
         if err is not None:
             log("[ble] write error:", err)
+        ack = getattr(self.owner, "close_ack", None)
+        if ack is not None:
+            ack.set()
 
 
 class RemoteMic:
@@ -334,6 +342,18 @@ class RemoteMic:
             if self.manager is not None:
                 self.manager.stopScan()
                 if self.peripheral is not None:
+                    if self.tx is not None:
+                        self.close_ack = threading.Event()
+                        self._send(bytes([8, 6, 0]) + bytes(17), "voice-close")
+                        deadline = time.monotonic() + 0.4
+                        while not self.close_ack.is_set() and time.monotonic() < deadline:
+                            if BLE_QUEUE is None:
+                                self.pump(0.01)
+                            else:
+                                self.close_ack.wait(0.01)
+                        self.close_ack = None
+                    if self.rx is not None:
+                        self.peripheral.setNotifyValue_forCharacteristic_(False, self.rx)
                     self.manager.cancelPeripheralConnection_(self.peripheral)
         except Exception:
             pass
@@ -342,11 +362,9 @@ class RemoteMic:
         if audio is not None:
             audio.close()
         self.manager = None
-        if self.peripheral is not None:
-            try:
-                self.peripheral.setNotifyValue_forCharacteristic_(False, self.rx)
-            except Exception:
-                pass
+        self.connected = False
+        self.notify_ready = False
+        self.stage = 0
 
     # ---- CoreBluetooth 回调 ----
     def on_central_state(self, cm, state):
@@ -370,7 +388,7 @@ class RemoteMic:
                 return
         self.status("正在搜索遥控器……请按一下遥控器任意键唤醒")
         log("[ble] 开始扫描（需遥控器广播）")
-        cm.scanForPeripheralsWithServices_([CB.CBUUID.UUIDWithString_(VOICE_SVC)], None)
+        cm.scanForPeripheralsWithServices_options_([CB.CBUUID.UUIDWithString_(VOICE_SVC)], None)
 
     def on_discovered(self, p, adv, rssi):
         name = (p.name() or "").replace("\u200b", "")
@@ -732,6 +750,23 @@ def selftest(seconds, prompt=False):
 
 
 # ---------------------------------------------------------------- GUI
+def install_shutdown_handlers(win, mic):
+    import signal
+    closing = False
+
+    def close():
+        nonlocal closing
+        if closing:
+            return
+        closing = True
+        mic.stop()
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", close)
+    win.createcommand("tk::mac::Quit", close)
+    signal.signal(signal.SIGTERM, lambda signum, frame: win.after(0, close))
+
+
 def gui():
     import tkinter as tk
     from tkinter import ttk, messagebox
@@ -769,6 +804,7 @@ def gui():
         messages.append(text)
 
     mic = RemoteMic(status=status)
+    install_shutdown_handlers(win, mic)
     start_key_guard(bool(mic.cfg.get("guard_remote_f5", True)))
 
     ttk.Label(win, text="斐讯遥控器 → 无线麦克风", style="Title.TLabel").pack(pady=(18, 8))
